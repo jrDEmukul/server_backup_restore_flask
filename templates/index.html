@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Backup and Restore</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f4f4;
+            color: #333;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+
+        h1 {
+            text-align: center;
+            color: #0056b3;
+        }
+
+        .container {
+            background-color: #fff;
+            padding: 20px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            border-radius: 10px;
+            width: 350px;
+            text-align: center;
+        }
+
+        img {
+            display: block;
+            margin: 0 auto 20px auto;
+            width: 150px;
+            height: auto;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+            color: #555;
+            text-align: left;
+        }
+
+        select, button {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+            font-size: 16px;
+        }
+
+        button {
+            background-color: #007bff;
+            color: #fff;
+            cursor: pointer;
+            border: none;
+        }
+
+        button:hover {
+            background-color: #0056b3;
+        }
+
+        .messages {
+            list-style: none;
+            padding: 0;
+        }
+
+        .messages li {
+            background-color: #ffdddd;
+            color: #d8000c;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+        }
+
+        @media (max-width: 400px) {
+            .container {
+                width: 90%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <img src="https://scholar9.com/assets/images/logo.png" alt="Logo" title="Logo">
+        <h1>Recover Code File</h1>
+
+        <form action="/" method="post">
+            <label for="backup_key">Select Backup File:</label>
+            <select name="backup_key" id="backup_key" required>
+                <option value="">--Select Backup--</option>
+                {% for backup in backups %}
+                    <option value="{{ backup.Key }}">{{ backup.Key }} ({{ backup.LastModified }})</option>
+                {% endfor %}
+            </select>
+
+            <label for="restore_option">Restore Option:</label>
+            <select name="restore_option" id="restore_option" required>
+                <option value="full">Full Backup</option>
+                <option value="db">Database Only</option>
+                <option value="code">Code Only</option>
+            </select>
+
+            <button type="submit">Restore</button>
+        </form>
+
+        {% with messages = get_flashed_messages() %}
+            {% if messages %}
+                <ul class="messages">
+                    {% for message in messages %}
+                        <li>{{ message }}</li>
+                    {% endfor %}
+                </ul>
+            {% endif %}
+        {% endwith %}
+    </div>
+</body>
+</html>
