@@ -1,22 +1,17 @@
-# app.py
-
 import os
-import shutil
-import zipfile
-from datetime import datetime
 import boto3
-from flask import Flask, render_template, request, redirect, url_for, flash
+import sqlite3
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from flask_wtf import FlaskForm
+from wtforms import StringField, PasswordField, SubmitField
+from wtforms.validators import DataRequired, Length
+from werkzeug.security import generate_password_hash, check_password_hash
 from botocore.exceptions import ClientError
 import tempfile
-import json
-import threading
+import paramiko
 import logging
-import subprocess
-from flask import Flask, jsonify
-from dotenv import load_dotenv
-from backup_utils import perform_backup, load_projects, save_projects
-from backup_scheduler import schedule_backup
-
+from datetime import datetime
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,14 +20,22 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 app.secret_key = 'your_secret_key'
 
-# Load environment variables
-load_dotenv()
+# Initialize Flask-Login
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'  # Redirect users to the login page if not logged in
 
-# AWS S3 configuration
+# Hardcoded values for SSH and root path
+SSH_USER = "root"
+SSH_KEY_PATH = "D:\\backup-script_app\\set_private1"  # Replace with the actual path to the private key
+MONGO_DB_NAME = "test_db"  # Replace with your MongoDB name
+ROOT_PATH = "/home/captain/application/sharklaravel"  # Hardcoded root path
+
+# Load environment variables
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 BUCKET_NAME = os.getenv('BUCKET_NAME')
-PREFIX = os.getenv('PREFIX')
+PREFIX = os.getenv('PREFIX', 'backups/')  # Default prefix
 
 # S3 client initialization
 s3_client = boto3.client(
@@ -41,296 +44,333 @@ s3_client = boto3.client(
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-def load_projects():
-    if os.path.exists('projects.json'):
-        with open('projects.json', 'r') as f:
-            return json.load(f)
-    return {}
+# SQLite database setup
+def init_db():
+    conn = sqlite3.connect('app_config.db')
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT NOT NULL UNIQUE,
+                        password TEXT NOT NULL
+                    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS backups (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        project_name TEXT NOT NULL,
+                        ssh_host TEXT NOT NULL,
+                        backup_path TEXT NOT NULL,
+                        root_path TEXT NOT NULL,
+                        timestamp TEXT NOT NULL
+                    )''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# User Model
+class User(UserMixin):
+    def __init__(self, id, username, password):
+        self.id = id
+        self.username = username
+        self.password = password
+
+# Flask-Login User Loader
+@login_manager.user_loader
+def load_user(user_id):
+    conn = sqlite3.connect('app_config.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+    if user:
+        return User(user[0], user[1], user[2])
+    return None
+
+# Login Form
+class LoginForm(FlaskForm):
+    username = StringField("Username", validators=[DataRequired(), Length(min=4, max=25)])
+    password = PasswordField("Password", validators=[DataRequired()])
+    submit = SubmitField("Login")
+
+# Register Form
+class RegisterForm(FlaskForm):
+    username = StringField("Username", validators=[DataRequired(), Length(min=4, max=25)])
+    password = PasswordField("Password", validators=[DataRequired()])
+    submit = SubmitField("Register")
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash("Logged out successfully!", "success")
+    return redirect(url_for("login"))
+
+# Perform backup and restore functions here (same as your previous implementation)
+
+
+@app.route('/')
+def home():
+    # Default behavior for the root route
+    if current_user.is_authenticated:
+        flash("You are already logged in.", "info")
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
 
 
 
-@app.route('/', methods=['GET', 'POST'])
-def index():
+@app.route('/dashboard', methods=['GET', 'POST'])
+@login_required
+def dashboard():
+    # Logic for the dashboard functionality
     if request.method == 'POST':
         project_name = request.form.get('project_name')
-        source_dir = request.form.get('source_directory')
-        db_user = request.form.get('db_user')
-        db_password = request.form.get('db_password')
-        db_name = request.form.get('db_name')
-        backup_time = request.form.get('backup_time')  # New field for backup time
+        ssh_host = request.form.get('ssh_host')
 
+        if not all([project_name, ssh_host]):
+            flash('Please provide all required fields.', 'danger')
+            return redirect(url_for('dashboard'))
 
-        if not all([project_name, source_dir, db_user, db_password, db_name, backup_time]):
-            flash('Please provide all required fields.')
-            return redirect(url_for('index'))
-        
-        # Validate backup_time format (HH:MM)
-        try:
-            datetime.strptime(backup_time, "%H:%M")
-        except ValueError:
-            flash('Invalid time format. Please use HH:MM.')
-            return redirect(url_for('index'))
+        # Perform backup logic
+        perform_backup(project_name, ssh_host)
+        flash(f'Backup process initiated for project: {project_name}', 'success')
+        return redirect(url_for('dashboard'))
 
-        # Save project details to a file or database (for simplicity, using JSON file here)
-        projects = load_projects()
-        projects[project_name] = {
-            'source_directory': source_dir,
-            'db_user': db_user,
-            'db_password': db_password,
-            'db_name': db_name,
-            'backup_time': backup_time  
-
-        }
-        save_projects(projects)
-        perform_backup(project_name, source_dir, db_user, db_password, db_name, backup_time)
-
-
-        flash(f'Backup scheduled for project: {project_name} at {backup_time}')
-        return redirect(url_for('index'))
-
+    # Render the dashboard page
     return render_template('index.html')
 
-def backup_current_code(source_dir, project_name):
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_filename = f"{project_name}-pre-restore-backup-{timestamp}.zip"
-    backup_path = os.path.join(tempfile.gettempdir(), backup_filename)
-    
-    with zipfile.ZipFile(backup_path, 'w') as zipf:
-        for root, _, files in os.walk(source_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                arcname = os.path.relpath(file_path, source_dir)
-                zipf.write(file_path, arcname)
-    
-    project_prefix = f"{PREFIX}{project_name}/"
-    s3_key = f"{project_prefix}{backup_filename}"
-    
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    form = LoginForm()
+    if form.validate_on_submit():
+        username = form.username.data
+        password = form.password.data
+
+        conn = sqlite3.connect('app_config.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+        user = cursor.fetchone()
+        conn.close()
+
+        if user and check_password_hash(user[2], password):
+            login_user(User(user[0], user[1], user[2]))
+            flash("Login successful!", "success")
+            return redirect(url_for('dashboard'))  # Explicitly redirect to the dashboard
+        flash("Invalid username or password!", "danger")
+    return render_template("login.html", form=form)
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    form = RegisterForm()
+    if form.validate_on_submit():
+        username = form.username.data
+        password = generate_password_hash(form.password.data)
+
+        conn = sqlite3.connect('app_config.db')
+        cursor = conn.cursor()
+        try:
+            cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, password))
+            conn.commit()
+            flash("User registered successfully!", "success")
+            return redirect(url_for('login'))
+        except sqlite3.IntegrityError:
+            flash("Username already exists!", "danger")
+        finally:
+            conn.close()
+    return render_template("register.html", form=form)
+
+def perform_backup(project_name, ssh_host):
     try:
-        s3_client.upload_file(backup_path, BUCKET_NAME, s3_key)
-        logging.info(f"Pre-restore backup created and uploaded: {s3_key}")
-    except ClientError as e:
-        logging.error(f"Error uploading pre-restore backup: {e}")
-    finally:
-        os.remove(backup_path)
+        root_path = ROOT_PATH
 
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(ssh_host, username=SSH_USER, key_filename=SSH_KEY_PATH)
+            logging.info(f"Connected to {ssh_host} as {SSH_USER}")
 
-def get_projects_from_s3():
-    try:
-        response = s3_client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=PREFIX)
-        
-        projects = set()
-        for item in response.get('Contents', []):
-            key = item['Key']
-            parts = key.split('/')
-            if len(parts) > 2:  # Ensure we have PREFIX/project_name/...
-                projects.add(parts[1])  # Add the project name
-        
-        projects = list(projects)
-        return projects
-    except ClientError as e:
-        logging.error(f"Error getting projects from S3: {e}")
-        return []
+            sanitized_project_name = project_name.replace(" ", "_")
+            combined_backup_path = "/tmp/combined_backup"
+            ssh.exec_command(f"mkdir -p {combined_backup_path}")
 
-@app.route('/delete_project', methods=['POST'])
-def delete_project():
-    project_name = request.form.get('project_name')
-    if not project_name:
-        return jsonify({'success': False, 'message': 'Project name is required'}), 400
+            mongo_dump_command = f"mongodump --db {MONGO_DB_NAME} --out {combined_backup_path}/mongo_backup"
+            stdin, stdout, stderr = ssh.exec_command(mongo_dump_command)
+            if stdout.channel.recv_exit_status() != 0:
+                raise RuntimeError(f"MongoDB dump failed: {stderr.read().decode()}")
+            logging.info("MongoDB dump created.")
 
-    # Delete project from S3
-    project_prefix = f"{PREFIX}{project_name}/"
-    try:
-        # List all objects with the project prefix
-        response = s3_client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=project_prefix)
-        
-        # Delete each object
-        for obj in response.get('Contents', []):
-            s3_client.delete_object(Bucket=BUCKET_NAME, Key=obj['Key'])
-        
-        # Delete the project from JSON file
-        projects = load_projects()
-        if project_name in projects:
-            del projects[project_name]
-            save_projects(projects)
-        
-        logging.info(f"Project {project_name} deleted successfully from S3 and JSON")
-        return jsonify({'success': True, 'message': f'Project {project_name} deleted successfully'})
-    except ClientError as e:
-        logging.error(f"Error deleting project from S3: {e}")
-        return jsonify({'success': False, 'message': f'Error deleting project: {str(e)}'}), 500
+            app_copy_command = f"cp -r {root_path} {combined_backup_path}/application"
+            stdin, stdout, stderr = ssh.exec_command(app_copy_command)
+            if stdout.channel.recv_exit_status() != 0:
+                raise RuntimeError(f"Application files copy failed: {stderr.read().decode()}")
+            logging.info("Application files copied.")
+
+            tar_filename = f"{sanitized_project_name}-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.tar.gz"
+            remote_tar_path = f"/tmp/{tar_filename}"
+            tar_command = f"tar -czf {remote_tar_path} -C {combined_backup_path} ."
+            stdin, stdout, stderr = ssh.exec_command(tar_command)
+            if stdout.channel.recv_exit_status() != 0:
+                raise RuntimeError(f"Tar command failed: {stderr.read().decode()}")
+            logging.info(f"Backup archive created: {remote_tar_path}")
+
+            local_tar_path = os.path.join(temp_dir, tar_filename)
+            with ssh.open_sftp() as sftp:
+                sftp.get(remote_tar_path, local_tar_path)
+
+            upload_to_s3(local_tar_path, tar_filename, f"{PREFIX}{sanitized_project_name}/")
+
+            conn = sqlite3.connect('app_config.db')
+            cursor = conn.cursor()
+            cursor.execute('''INSERT INTO backups (project_name, ssh_host, backup_path, root_path, timestamp)
+                  VALUES (?, ?, ?, ?, ?)''',
+               (project_name, ssh_host, f"{PREFIX}{sanitized_project_name}/{tar_filename}", 
+                ROOT_PATH, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+
+            conn.commit()
+            conn.close()
+            logging.info("Backup details saved to database.")
+
+            cleanup_command = f"rm -rf {combined_backup_path} {remote_tar_path}"
+            ssh.exec_command(cleanup_command)
+            ssh.close()
+
     except Exception as e:
-        logging.error(f"Unexpected error deleting project: {e}")
-        return jsonify({'success': False, 'message': f'Unexpected error: {str(e)}'}), 500
+        logging.error(f"Error during backup: {e}")
+        raise
+
+
 
 @app.route('/restore', methods=['GET', 'POST'])
+@login_required
 def restore():
-    projects = get_projects_from_s3()
-    
-    if not projects:
-        flash("No projects found in S3.")
-        return render_template('restore.html', projects=[], selected_project=None, backups=[])
-
-    selected_project = request.args.get('project_name') or request.form.get('project_name') or (projects[0] if projects else None)
-    
-    backups = []
-    if selected_project:
-        project_prefix = f"{PREFIX}{selected_project}/"
+    if request.method == 'GET':
+        # Fetch available projects and backups from S3
         try:
-            response = s3_client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=project_prefix)
-            backups = [
-                {
-                    'Key': item['Key'],
-                    'LastModified': item['LastModified'].strftime('%Y-%m-%d %H:%M:%S')
-                }
-                for item in response.get('Contents', [])
-                if item['Key'].lower().endswith('.zip')
-            ]
+            objects = s3_client.list_objects(Bucket=BUCKET_NAME, Prefix=PREFIX).get('Contents', [])
+            if not objects:
+                flash('No backups found in S3.', 'info')
+                return redirect(url_for('dashboard'))
+
+            # Extract projects and backups properly
+            projects = sorted(set(obj['Key'].split('/')[0] for obj in objects if '/' in obj['Key']))
+            backups = [{'Key': obj['Key'], 'Name': obj['Key'].split('/')[-1]} for obj in objects if obj['Key']]
         except ClientError as e:
-            flash(f'Error listing backups: {e}')
-            logging.error(f'Error listing backups: {e}')
+            logging.error(f"Error fetching backup list from S3: {e}")
+            flash('Failed to fetch backups from S3.', 'error')
+            return redirect(url_for('dashboard'))
 
-    if request.method == 'POST':
-        project_name = request.form.get('project_name')
-        backup_key = request.form.get('backup_key')
-        restore_option = request.form.get('restore_option')
+        return render_template('restore.html', projects=projects, backups=backups)
 
-        if not project_name or not backup_key:
-            flash('Please select both a project and a backup file to restore.')
-            return redirect(url_for('restore'))
+    # Handle POST request for restore
+    project_name = request.form.get('project_name')
+    backup_key = request.form.get('backup_key')
+    ssh_host = request.form.get('ssh_host')
 
-        project_prefix = f"{PREFIX}{project_name}/"
-        backup_file = os.path.basename(backup_key)
-        temp_dir = tempfile.mkdtemp()
+    if not all([project_name, backup_key, ssh_host]):
+        return jsonify({'success': False, 'message': 'All fields are required'}), 400
 
-        try:
-            project_details = load_projects().get(project_name)
-            if project_details:
-                # Backup current code before restoration
-                if restore_option in ['full', 'code']:
-                    backup_current_code(project_details['source_directory'], project_name)
+    try:
+        # Perform pre-restoration backup
+        logging.info("Initiating pre-restoration backup...")
+        perform_backup(f"pre_restore_{project_name}", ssh_host)
 
-                # Download the backup file
-                with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                    s3_client.download_fileobj(BUCKET_NAME, backup_key, temp_file)
-                    temp_file_path = temp_file.name
+        # Local and remote paths for the backup tarball
+        local_tmp_dir = tempfile.mkdtemp()
+        local_backup_path = os.path.join(local_tmp_dir, os.path.basename(backup_key))
+        remote_tar_path = f"/tmp/{os.path.basename(backup_key)}"
 
-                # Extract the backup
-                with zipfile.ZipFile(temp_file_path, 'r') as zip_ref:
-                    zip_ref.extractall(temp_dir)
+        # Step 1: Download the backup tarball from S3
+        s3_client.download_file(BUCKET_NAME, backup_key, local_backup_path)
+        logging.info(f"Backup tarball downloaded to local path: {local_backup_path}")
 
-                # Clear existing code and database based on restore option
-                clear_existing_code_and_db(
-                    restore_option,
-                    project_details['source_directory'],
-                    project_details['db_user'],
-                    project_details['db_password'],
-                    project_details['db_name']
-                )
+        # Step 2: Upload the tarball to the remote server
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(ssh_host, username=SSH_USER, key_filename=SSH_KEY_PATH)
 
-                # Perform restore based on selected option
-                if restore_option in ['full', 'code']:
-                    restore_code(temp_dir, project_details['source_directory'])
-                if restore_option in ['full', 'db']:
-                    restore_db(
-                        temp_dir,
-                        project_details['db_user'],
-                        project_details['db_password'],
-                        project_details['db_name']
-                    )
+        with ssh.open_sftp() as sftp:
+            sftp.put(local_backup_path, remote_tar_path)
+        logging.info(f"Backup tarball uploaded to remote server at: {remote_tar_path}")
 
-                flash(f'Restore completed successfully from: {backup_file}')
-            else:
-                flash(f'Project "{project_name}" not found in local configuration. Please add it first.')
+        # Step 3: Extract the tarball on the remote server
+        extract_command = f"tar -xzvf {remote_tar_path} -C /tmp"
+        stdin, stdout, stderr = ssh.exec_command(extract_command)
+        if stdout.channel.recv_exit_status() != 0:
+            raise RuntimeError(f"Extraction failed: {stderr.read().decode()}")
+        logging.info(f"Backup tarball extracted on the remote server: /tmp")
 
-        except ClientError as e:
-            flash(f'Error during restore: {e}')
-            logging.error(f'Error during restore: {e}')
-        except Exception as e:
-            flash(f'Unexpected error during restore: {e}')
-            logging.error(f'Unexpected error during restore: {e}')
-        finally:
-            if temp_file_path and os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
-            shutil.rmtree(temp_dir)
+        # Step 4: Restore MongoDB database
+        mongo_restore_command = f"mongorestore --drop --dir=/tmp/mongo_backup"
+        stdin, stdout, stderr = ssh.exec_command(mongo_restore_command)
+        if stdout.channel.recv_exit_status() != 0:
+            raise RuntimeError(f"MongoDB restore failed: {stderr.read().decode()}")
+        logging.info("MongoDB database restored successfully.")
 
-        return redirect(url_for('restore'))
+        # Step 5: Locate the correct `htdocs` directory
+        locate_dir_command = "find /tmp/application -type d -name 'htdocs'"
+        stdin, stdout, stderr = ssh.exec_command(locate_dir_command)
+        all_dirs = stdout.read().decode().strip().split("\n")
+        stderr_output = stderr.read().decode()
 
-    # Default to showing backups for the first project, or let the user select
-    selected_project = request.args.get('project_name', projects[0] if projects else None)
-    project_prefix = f"{PREFIX}{selected_project}/" if selected_project else ""
+        if stderr_output:
+            logging.error(f"Error locating 'htdocs': {stderr_output}")
 
-    # List available backups for the selected project
-    backups = []
-    if project_prefix:
-        try:
-            response = s3_client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=project_prefix)
-            backups = response.get('Contents', [])
-        except ClientError as e:
-            flash(f'Error listing backups: {e}')
-            logging.error(f'Error listing backups: {e}')
+        # Filter the correct directory path
+        target_dir = None
+        for dir_path in all_dirs:
+            if dir_path.endswith("/htdocs"):
+                target_dir = dir_path
+                break
 
-    # Convert datetime objects to string
-    backup_files = [{'Key': b['Key'], 'LastModified': b['LastModified'].isoformat()} for b in backups]
+        if not target_dir:
+            raise FileNotFoundError("Application directory (htdocs) not found in the extracted backup.")
 
-    return render_template('restore.html', projects=projects, selected_project=selected_project, backups=backup_files)
+        logging.info(f"Target application directory identified: {target_dir}")
 
+        # Ensure ROOT_PATH exists
+        check_root_path_command = f"mkdir -p {ROOT_PATH}"
+        ssh.exec_command(check_root_path_command)
 
+        # Copy the application files to ROOT_PATH
+        app_restore_command = f"rsync -avz {target_dir}/ {ROOT_PATH}/htdocs"
+        stdin, stdout, stderr = ssh.exec_command(app_restore_command)
+        restore_stderr = stderr.read().decode()
 
-def clear_existing_code_and_db(restore_option, source_dir, db_user, db_password, db_name):
-    if restore_option in ['code', 'full']:
-        for root, dirs, files in os.walk(source_dir, topdown=False):
-            for name in files:
-                os.remove(os.path.join(root, name))
-            for name in dirs:
-                os.rmdir(os.path.join(root, name))
-        logging.info("Existing code cleared successfully")
+        if stdout.channel.recv_exit_status() != 0 or restore_stderr:
+            logging.error(f"Application files restoration failed: {restore_stderr}")
+            raise RuntimeError(f"Application files restoration failed: {restore_stderr}")
 
-    if restore_option in ['db', 'full']:
-        try:
-            clear_db_command = [
-                "mysql",
-                "-u", os.getenv('DB_USER'),
-                "-p" + os.getenv('DB_PASSWORD'),
-                "-e", f"DROP DATABASE IF EXISTS {os.getenv('DB_NAME')}; CREATE DATABASE {os.getenv('DB_NAME')};"
-            ]
-            result = subprocess.run(clear_db_command, capture_output=True, text=True, check=True)
+        logging.info(f"Application files restored to: {ROOT_PATH}/htdocs")
 
-            if result.returncode != 0:
-                logging.error(f"Error clearing existing database. Exit code: {result.returncode}")
-                logging.error(f"Error output: {result.stderr}")
-            else:
-                logging.info("Existing database cleared successfully")
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Error clearing existing database: {e}")
-        except Exception as e:
-            logging.error(f"Unexpected error: {e}")
+        # Step 6: Clean up temporary files
+        cleanup_command = f"rm -rf {remote_tar_path} /tmp/mongo_backup /tmp/application"
+        ssh.exec_command(cleanup_command)
+        ssh.close()
+
+        # Clean up local temporary folder
+        os.remove(local_backup_path)
+        os.rmdir(local_tmp_dir)
+        logging.info("Temporary files cleaned up.")
+
+        return jsonify({'success': True, 'message': 'Restore completed successfully'})
+
+    except Exception as e:
+        logging.error(f"Error during restore: {e}")
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 
-def restore_code(temp_dir, target_dir):
-    for root, _, files in os.walk(temp_dir):
-        for file in files:
-            if not file.endswith('.sql'):
-                file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, temp_dir)
-                dest_path = os.path.join(target_dir, rel_path)
-                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                shutil.copy2(file_path, dest_path)
-    logging.info(f"Code restored successfully from {temp_dir} to {target_dir}")
 
-def restore_db(temp_dir, db_user, db_password, db_name):
-    for file in os.listdir(temp_dir):
-        if file.endswith(".sql"):
-            sql_file = os.path.join(temp_dir, file)
-            try:
-                restore_command = f"mysql -u {db_user} -p{db_password} {db_name} < {sql_file}"
-                subprocess.run(restore_command, shell=True, check=True, stderr=subprocess.DEVNULL)
-                logging.info(f"Database restored successfully from {file}")
-            except subprocess.CalledProcessError as e:
-                logging.error(f"Error restoring database: {e}")
-            finally:
-                os.remove(sql_file)
-                logging.info(f"Removed SQL dump file: {file}")
-            break
+
+
+
+
+def upload_to_s3(file_path, file_name, project_prefix):
+    try:
+        s3_client.upload_file(file_path, BUCKET_NAME, f"{project_prefix}{file_name}")
+        logging.info(f"Successfully uploaded {file_name} to S3")
+    except ClientError as e:
+        logging.error(f"Error uploading to S3: {e}")
+
 
 if __name__ == '__main__':
     app.run(debug=True)
